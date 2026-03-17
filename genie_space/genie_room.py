@@ -17,6 +17,16 @@ SPACE_ID = os.environ.get("SPACE_ID")
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
 
 
+def _make_workspace_client(host: str = None, user_token: str = None) -> WorkspaceClient:
+    """Create a WorkspaceClient using OBO token when available, else default auth."""
+    if user_token:
+        h = f"https://{host}" if host and not host.startswith("https://") else host
+        logger.info("[OBO] Using user token for authentication")
+        return WorkspaceClient(host=h, token=user_token)
+    logger.info("[OBO] No user token — falling back to default auth (SP)")
+    return WorkspaceClient()
+
+
 @dataclass
 class GenieResponse:
     """Structured response from Genie containing all available data."""
@@ -30,10 +40,10 @@ class GenieResponse:
 
 
 class GenieClient:
-    def __init__(self, host: str, space_id: str):
+    def __init__(self, host: str, space_id: str, user_token: str = None):
         self.host = host
         self.space_id = space_id
-        self.ws = WorkspaceClient()
+        self.ws = _make_workspace_client(host, user_token)
         self.api_path = f"/api/2.0/genie/spaces/{space_id}"
 
     @backoff.on_exception(
@@ -165,19 +175,21 @@ class GenieClient:
 
         raise TimeoutError(f"Message processing timed out after {timeout} seconds")
 
-def start_new_conversation(question: str) -> Tuple[Optional[str], GenieResponse]:
+def start_new_conversation(question: str, user_token: str = None) -> Tuple[Optional[str], GenieResponse]:
     """
     Start a new conversation with Genie.
 
     Args:
         question: The initial question
+        user_token: OBO token from X-Forwarded-Access-Token header (optional)
 
     Returns:
         Tuple of (conversation_id, GenieResponse)
     """
     client = GenieClient(
         host=DATABRICKS_HOST,
-        space_id=SPACE_ID
+        space_id=SPACE_ID,
+        user_token=user_token
     )
 
     try:
@@ -197,13 +209,14 @@ def start_new_conversation(question: str) -> Tuple[Optional[str], GenieResponse]
             error=str(e)
         )
 
-def continue_conversation(conversation_id: str, question: str) -> GenieResponse:
+def continue_conversation(conversation_id: str, question: str, user_token: str = None) -> GenieResponse:
     """
     Send a follow-up message in an existing conversation.
 
     Args:
         conversation_id: The existing conversation ID
         question: The follow-up question
+        user_token: OBO token from X-Forwarded-Access-Token header (optional)
 
     Returns:
         GenieResponse with all available data
@@ -212,7 +225,8 @@ def continue_conversation(conversation_id: str, question: str) -> GenieResponse:
 
     client = GenieClient(
         host=DATABRICKS_HOST,
-        space_id=SPACE_ID
+        space_id=SPACE_ID,
+        user_token=user_token
     )
 
     try:
@@ -311,18 +325,19 @@ def process_genie_response(client, conversation_id, message_id, complete_message
 
     return response
 
-def genie_query(question: str) -> GenieResponse:
+def genie_query(question: str, user_token: str = None) -> GenieResponse:
     """
     Main entry point for querying Genie.
 
     Args:
         question: The question to ask
+        user_token: OBO token from X-Forwarded-Access-Token header (optional)
 
     Returns:
         GenieResponse with text_response, sql_query, sql_description, data, and data_summary
     """
     try:
-        conversation_id, result = start_new_conversation(question)
+        conversation_id, result = start_new_conversation(question, user_token=user_token)
         return result
 
     except Exception as e:
