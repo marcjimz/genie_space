@@ -1,14 +1,12 @@
 import pandas as pd
 import time
-import requests
 import os
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 import logging
 import backoff
-import uuid
-from token_minter import TokenMinter
+from databricks.sdk import WorkspaceClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -17,14 +15,6 @@ load_dotenv()
 # Load environment variables
 SPACE_ID = os.environ.get("SPACE_ID")
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
-CLIENT_ID = os.environ.get("DATABRICKS_CLIENT_ID")
-CLIENT_SECRET = os.environ.get("DATABRICKS_CLIENT_SECRET")
-
-token_minter = TokenMinter(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-    host=DATABRICKS_HOST
-)
 
 
 @dataclass
@@ -43,20 +33,12 @@ class GenieClient:
     def __init__(self, host: str, space_id: str):
         self.host = host
         self.space_id = space_id
-        self.update_headers()
-        
-        self.base_url = f"https://{host}/api/2.0/genie/spaces/{space_id}"
-    
-    def update_headers(self) -> None:
-        """Update headers with fresh token from token_minter"""
-        self.headers = {
-            "Authorization": f"Bearer {token_minter.get_token()}",
-            "Content-Type": "application/json"
-        }
-    
+        self.ws = WorkspaceClient()
+        self.api_path = f"/api/2.0/genie/spaces/{space_id}"
+
     @backoff.on_exception(
         backoff.expo,
-        Exception,  
+        Exception,
         max_tries=5,
         factor=2,
         jitter=backoff.full_jitter,
@@ -66,17 +48,15 @@ class GenieClient:
     )
     def start_conversation(self, question: str) -> Dict[str, Any]:
         """Start a new conversation with the given question"""
-        self.update_headers()  # Refresh token before API call
-        url = f"{self.base_url}/start-conversation"
-        payload = {"content": question}
-        
-        response = requests.post(url, headers=self.headers, json=payload)
-        response.raise_for_status()
-        return response.json()
-    
+        return self.ws.api_client.do(
+            "POST",
+            f"{self.api_path}/start-conversation",
+            body={"content": question}
+        )
+
     @backoff.on_exception(
         backoff.expo,
-        Exception,  # Retry on any exception
+        Exception,
         max_tries=5,
         factor=2,
         jitter=backoff.full_jitter,
@@ -86,17 +66,15 @@ class GenieClient:
     )
     def send_message(self, conversation_id: str, message: str) -> Dict[str, Any]:
         """Send a follow-up message to an existing conversation"""
-        self.update_headers()  # Refresh token before API call
-        url = f"{self.base_url}/conversations/{conversation_id}/messages"
-        payload = {"content": message}
-        
-        response = requests.post(url, headers=self.headers, json=payload)
-        response.raise_for_status()
-        return response.json()
+        return self.ws.api_client.do(
+            "POST",
+            f"{self.api_path}/conversations/{conversation_id}/messages",
+            body={"content": message}
+        )
 
     @backoff.on_exception(
         backoff.expo,
-        Exception,  # Retry on any exception
+        Exception,
         max_tries=5,
         factor=2,
         jitter=backoff.full_jitter,
@@ -106,16 +84,14 @@ class GenieClient:
     )
     def get_message(self, conversation_id: str, message_id: str) -> Dict[str, Any]:
         """Get the details of a specific message"""
-        self.update_headers()  # Refresh token before API call
-        url = f"{self.base_url}/conversations/{conversation_id}/messages/{message_id}"
-        
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+        return self.ws.api_client.do(
+            "GET",
+            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}"
+        )
 
     @backoff.on_exception(
         backoff.expo,
-        Exception,  # Retry on any exception
+        Exception,
         max_tries=5,
         factor=2,
         jitter=backoff.full_jitter,
@@ -125,19 +101,17 @@ class GenieClient:
     )
     def get_query_result(self, conversation_id: str, message_id: str, attachment_id: str) -> Dict[str, Any]:
         """Get the query result using the attachment_id endpoint"""
-        self.update_headers()  # Refresh token before API call
-        url = f"{self.base_url}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/query-result"
-        
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        result = response.json()
-        
+        result = self.ws.api_client.do(
+            "GET",
+            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/query-result"
+        )
+
         # Extract data_array from the correct nested location
         data_array = []
         if 'statement_response' in result:
             if 'result' in result['statement_response']:
                 data_array = result['statement_response']['result'].get('data_array', [])
-            
+
         return {
                     'data_array': data_array,
                     'schema': result.get('statement_response', {}).get('manifest', {}).get('schema', {})
@@ -145,7 +119,7 @@ class GenieClient:
 
     @backoff.on_exception(
         backoff.expo,
-        Exception,  # Retry on any exception
+        Exception,
         max_tries=5,
         factor=2,
         jitter=backoff.full_jitter,
@@ -155,42 +129,40 @@ class GenieClient:
     )
     def execute_query(self, conversation_id: str, message_id: str, attachment_id: str) -> Dict[str, Any]:
         """Execute a query using the attachment_id endpoint"""
-        self.update_headers()  # Refresh token before API call
-        url = f"{self.base_url}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/execute-query"
-        
-        response = requests.post(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-    
+        return self.ws.api_client.do(
+            "POST",
+            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/execute-query"
+        )
+
 
     def wait_for_message_completion(self, conversation_id: str, message_id: str, timeout: int = 300, poll_interval: int = 2) -> Dict[str, Any]:
         """
         Wait for a message to reach a terminal state (COMPLETED, ERROR, etc.).
-        
+
         Args:
             conversation_id: The ID of the conversation
             message_id: The ID of the message
             timeout: Maximum time to wait in seconds
             poll_interval: Time between status checks in seconds
-            
+
         Returns:
             The completed message
         """
-        
+
         start_time = time.time()
         attempt = 1
-        
+
         while time.time() - start_time < timeout:
-            
+
             message = self.get_message(conversation_id, message_id)
             status = message.get("status")
-            
+
             if status in ["COMPLETED", "ERROR", "FAILED"]:
                 return message
-                
+
             time.sleep(poll_interval)
             attempt += 1
-            
+
         raise TimeoutError(f"Message processing timed out after {timeout} seconds")
 
 def start_new_conversation(question: str) -> Tuple[Optional[str], GenieResponse]:
@@ -360,4 +332,3 @@ def genie_query(question: str) -> GenieResponse:
             status="ERROR",
             error=str(e)
         )
-
