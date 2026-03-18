@@ -1,108 +1,100 @@
-# Databricks Genie API Integration Demo
+# Genie Space Embed
 
+A Dash application that embeds Databricks AI/BI Genie as a chat interface, deployed as a Databricks App.
 
-![](./assets/genie_room0.png)
-![](./assets/genie-space.png)
-![](./assets/genie-space4.png)
+## Authorization Architecture
 
-This repository demonstrates how to integrate Databricks' AI/BI Genie Conversation APIs into custom Databricks Apps applications, allowing users to interact with their structured data using natural language.
+This app uses two authorization modes:
 
-You can also click the Generate insights button and generate deep analysis and trends of your data.
-![](./assets/insights1.png)
-![](./assets/insights2.png)
+### GenieMetadataClient (Service Principal)
 
+Fetches Genie Space metadata (title, description, sample questions) on page load.
 
+- **Auth**: Service Principal (oauth-m2m) via `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` env vars
+- **Why SP?**: The Genie Space metadata API (`GET /api/2.0/genie/spaces/{id}`) requires the `genie` OAuth scope, which is not currently a valid scope for Databricks Apps OBO tokens.
 
-## Overview
+**SP permissions required:**
 
-This app is a Dash application featuring a chat interface powered by Databricks Genie Conversation APIs, built specifically to run as a Databricks App. This integration showcases how to leverage Databricks' platform capabilities to create interactive data applications with minimal infrastructure overhead.
+| Resource | Permission |
+|----------|-----------|
+| Genie Space | `CAN_EDIT` |
+| UC Catalog | `USE CATALOG` |
+| UC Schema | `USE SCHEMA` |
+| UC Tables (underlying the Genie Space) | `SELECT` |
 
-The Databricks Genie Conversation APIs (in Public Preview) enable you to embed AI/BI Genie capabilities into any application, allowing users to:
-- Ask questions about their data in natural language
-- Get SQL-powered insights without writing code
-- Follow up with contextual questions in a conversation thread
+### LLM Insights (Service Principal)
 
-## Key Features
+Calls a model serving endpoint to generate insights from query results.
 
-- **Powered by Databricks Apps**: Deploy and run directly from your Databricks workspace with built-in security and scaling
-- **Zero Infrastructure Management**: Leverage Databricks Apps to handle hosting, scaling, and security
-- **Workspace Integration**: Access your data assets and models directly from your Databricks workspace
-- **Natural Language Data Queries**: Ask questions about your data in plain English
-- **Stateful Conversations**: Maintain context for follow-up questions
+- **Auth**: Service Principal (same as above)
+- **Why SP?**: The model serving API requires the `model-serving` scope, which is not a valid scope for Databricks Apps OBO tokens.
 
-## Example Use Case
+**SP permissions required:**
 
-This demo shows how to create a simple interface that connects to the Genie API, allowing users to:
-1. Start a conversation with a question about their supply chain data
-2. View generated SQL and results
-3. Ask follow-up questions that maintain context
+| Resource | Permission |
+|----------|-----------|
+| Serving Endpoint | `CAN_QUERY` |
 
-## Deploying to Databricks apps
+### GenieQueryClient (On-Behalf-Of User)
 
-1. Clone the repository to workspace directory such as 
-/Workspace/Users/wenwen.xie@databricks.com/genie_space
-```bash
-git clone https://github.com/vivian-xie-db/genie_space.git
-```
-![](./assets/genie-space1.png)
+Executes Genie queries as the logged-in user via their OBO token.
 
+- **Auth**: OBO token from `X-Forwarded-Access-Token` request header
+- **App OAuth scopes**: `dashboards.genie`, `sql`
 
-2. Change the "SPACE_ID" environment value to the ID of your Genie space, for example, 01f02a31663e19b0a18f1a2ed7a435a7 in the app.yaml file in the root directory and add 
-a model serving endpoint in App resources for adding a model for insights generation:
+**User permissions required:**
 
-```yaml
-command:
-- "python"
-- "app.py"
+| Resource | Permission |
+|----------|-----------|
+| Genie Space | `CAN_RUN` (or higher) |
+| UC Tables (underlying the Genie Space) | `SELECT` |
 
-env:
-- name: "SPACE_ID"
-  value: "space_id"
-- name: "SERVING_ENDPOINT_NAME"
-  valueFrom: "serving_endpoint"
+## Deployment
 
-```
-![](./assets/genie-space7.png)
-![](./assets/genie-space8.png)
+1. Clone to a Databricks workspace directory:
+   ```
+   /Workspace/Users/<you>/genie_space_embed
+   ```
 
-3. Create an app in the Databricks apps interface and then deploy the path to the code
+2. Create a Databricks App and configure `app.yaml`:
+   ```yaml
+   command:
+   - "python"
+   - "app.py"
 
-![](./assets/genie-space2.png)
+   env:
+   - name: "SPACE_ID"
+     valueFrom: "genie-space"
+   - name: "SERVING_ENDPOINT_NAME"
+     valueFrom: "serving-endpoint"
 
-4. Grant the service principal can_run permission to the genie space.
-![](./assets/genie-space9.png)
+   authorization:
+     type: oauth
+     scopes:
+       - genie
+       - sql
+   ```
+   The `authorization.scopes` section is required — it controls which scopes the OAuth flow requests for OBO tokens. Without it, queries will fail with `403 Invalid scope`.
 
-5. Grant the service principal permission can_use to the SQL warehouse that powers genie
+3. In the App settings, add resources:
+   - **genie-space**: Your Genie Space ID (SP gets `CAN_EDIT`)
+   - **serving-endpoint**: A model serving endpoint for insights generation (SP gets `CAN_QUERY`)
 
-![](./assets/genie-space5.png)
+4. Grant the App's Service Principal access to the UC tables underlying the Genie Space:
+   ```sql
+   GRANT USE CATALOG ON CATALOG <catalog> TO `<sp-name>`;
+   GRANT USE SCHEMA ON SCHEMA <catalog>.<schema> TO `<sp-name>`;
+   GRANT SELECT ON SCHEMA <catalog>.<schema> TO `<sp-name>`;
+   ```
 
+5. Grant end users access to the Genie Space (`CAN_RUN`) and `SELECT` on the underlying UC tables.
 
-![](./assets/genie-space6.png)
-
-6. Grant the service principal appropriate privileges to the underlying resources such as catalog, schema and tables.
-
-   note: I am using ALL PRIVILEGES for demo purpose but you can do use catalog on catalog, use schema on schema and select on tables
-
-![](./assets/table1.png)
-
-![](./assets/table2.png)
-
-![](./assets/table3.png)
-
-6. Troubleshooting issues:
-   
-   For trouble shooting, navigate to the genie room monitoring page and check if the query has been sent successfully to the genie room via the API. 
-
-![](./assets/troubleshooting1.png)
-
-   Click open the query and check if there is any error or any permission issues.
-
-
-![](./assets/troubleshooting2.png)
-
+6. Deploy:
+   ```bash
+   databricks apps deploy <app-name> --source-code-path /Workspace/Users/<you>/genie_space_embed
+   ```
 
 ## Resources
 
-- [Databricks Genie Documentation](https://docs.databricks.com/aws/en/genie)
-- [Conversation APIs Documentation](https://docs.databricks.com/api/workspace/genie)
-- [Databricks Apps Documentation](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/)
+- [Genie Conversation APIs](https://docs.databricks.com/api/workspace/genie)
+- [Databricks Apps](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/)

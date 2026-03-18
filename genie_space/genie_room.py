@@ -1,30 +1,63 @@
+"""
+Genie Space API clients with dual-auth architecture.
+
+Authorization Architecture
+==========================
+
+GenieMetadataClient (Service Principal)
+  Reads Genie Space metadata: title, description, sample questions.
+  - Auth: SP (oauth-m2m) via DATABRICKS_CLIENT_ID/SECRET env vars
+  - SP permissions required:
+      * Genie Space resource: CAN_EDIT
+      * UC catalog: USE CATALOG
+      * UC schema: USE SCHEMA
+      * UC tables: SELECT (on the tables underlying the Genie Space)
+  - Note: GET /api/2.0/genie/spaces/{id} requires the 'genie' OAuth scope,
+    which is NOT a valid scope for Databricks Apps OBO tokens. Setting
+    'genie' in app.yaml authorization.scopes maps to 'dashboards.genie'
+    (query APIs only), not the management-level scope. SP auth is
+    therefore required for this endpoint.
+  - If include_serialized_space=true fails (needs UC table access), the
+    client falls back to a basic fetch (title/description only).
+
+GenieQueryClient (On-Behalf-Of User)
+  Executes Genie queries as the logged-in user.
+  - Auth: OBO token from X-Forwarded-Access-Token request header
+  - App OAuth scopes: dashboards.genie, sql
+  - User permissions required:
+      * Genie Space resource: CAN_RUN (or higher)
+      * UC tables: SELECT (on the tables underlying the Genie Space)
+  - Falls back to SP auth when no OBO token is present (local dev)
+
+LLM Insights (Service Principal)
+  Calls model serving endpoint for data insights generation.
+  - Auth: SP (oauth-m2m) — same as GenieMetadataClient
+  - SP permissions required:
+      * Serving endpoint resource: CAN_QUERY
+  - Note: The 'model-serving' OAuth scope required by serving endpoints
+    is not a valid scope for Databricks Apps OBO tokens.
+
+TODO: When 'genie' and 'model-serving' OAuth scopes are formally added
+      to Databricks Apps, migrate to OBO auth and remove the SP dependency.
+"""
+import json
 import pandas as pd
 import time
 import os
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import logging
 import backoff
 from databricks.sdk import WorkspaceClient
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Load environment variables
 SPACE_ID = os.environ.get("SPACE_ID")
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
-
-
-def _make_workspace_client(host: str = None, user_token: str = None) -> WorkspaceClient:
-    """Create a WorkspaceClient using OBO token when available, else default auth."""
-    if user_token:
-        h = f"https://{host}" if host and not host.startswith("https://") else host
-        logger.info("[OBO] Using user token for authentication")
-        return WorkspaceClient(host=h, token=user_token)
-    logger.info("[OBO] No user token — falling back to default auth (SP)")
-    return WorkspaceClient()
 
 
 @dataclass
@@ -39,311 +72,299 @@ class GenieResponse:
     error: Optional[str] = None
 
 
-class GenieClient:
+# ---------------------------------------------------------------------------
+# GenieMetadataClient — SP auth for space metadata
+# ---------------------------------------------------------------------------
+
+class GenieMetadataClient:
+    """Reads Genie Space metadata using Service Principal auth.
+
+    Permissions profile:
+      - Auth: oauth-m2m (picks up DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET)
+      - Genie Space resource: CAN_EDIT
+      - UC tables: USE_CATALOG + USE_SCHEMA + SELECT (for sample questions via serialized_space)
+
+    Note: The Genie Space metadata API (GET /api/2.0/genie/spaces/{id}) requires
+    the 'genie' OAuth scope, which is NOT a valid scope for Databricks Apps OBO
+    tokens. Tested: both 'dashboards.genie' and 'genie' scopes fail — 'genie' is
+    rejected as invalid by the Apps API. SP auth is therefore required.
+    """
+
+    def __init__(self):
+        logger.info("[GenieMetadataClient] Initializing with SP auth")
+        self._ws = WorkspaceClient()  # Uses SP creds from env
+
+    def get_space_metadata(self, space_id: str) -> Dict[str, Any]:
+        """Fetch space metadata (title, description, sample questions).
+
+        Tries include_serialized_space=true first for sample questions.
+        Falls back to basic fetch (title only) if that fails.
+
+        Returns:
+            dict with keys: title, description, sample_questions (list of str)
+        """
+        result = {"title": None, "description": None, "sample_questions": []}
+
+        # Try full fetch (includes sample questions in serialized_space)
+        try:
+            resp = self._ws.api_client.do(
+                "GET",
+                f"/api/2.0/genie/spaces/{space_id}?include_serialized_space=true",
+            )
+            logger.info("[GenieMetadataClient] Fetched metadata with serialized_space")
+            result["title"] = resp.get("title")
+            result["description"] = resp.get("description")
+
+            ss_raw = resp.get("serialized_space")
+            if ss_raw:
+                ss = json.loads(ss_raw)
+                sq = ss.get("config", {}).get("sample_questions", [])
+                for q in sq:
+                    questions = q.get("question", [])
+                    if questions:
+                        result["sample_questions"].append(questions[0])
+                logger.info(
+                    f"[GenieMetadataClient] Found {len(result['sample_questions'])} sample questions"
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"[GenieMetadataClient] Full fetch failed: {e}")
+
+        # Fallback: basic metadata (no serialized_space, no table access needed)
+        try:
+            resp = self._ws.api_client.do(
+                "GET",
+                f"/api/2.0/genie/spaces/{space_id}",
+            )
+            result["title"] = resp.get("title")
+            result["description"] = resp.get("description")
+            logger.info(
+                f"[GenieMetadataClient] Basic fetch OK — title: {result['title']}"
+            )
+        except Exception as e2:
+            logger.error(f"[GenieMetadataClient] Basic fetch also failed: {e2}")
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# GenieQueryClient — OBO auth for data queries
+# ---------------------------------------------------------------------------
+
+class GenieQueryClient:
+    """Executes Genie queries using On-Behalf-Of (OBO) user auth.
+
+    Permissions profile:
+      - Auth: OBO token (X-Forwarded-Access-Token header) with auth_type=pat
+      - App OAuth scopes: dashboards.genie, sql
+      - User needs: access to the Genie Space + underlying UC tables
+      - Fallback: SP auth when no OBO token is present (local dev)
+    """
+
     def __init__(self, host: str, space_id: str, user_token: str = None):
         self.host = host
         self.space_id = space_id
-        self.ws = _make_workspace_client(host, user_token)
-        self.api_path = f"/api/2.0/genie/spaces/{space_id}"
+        if user_token:
+            h = f"https://{host}" if host and not host.startswith("https://") else host
+            logger.info("[GenieQueryClient] Using OBO token")
+            self._ws = WorkspaceClient(host=h, token=user_token, auth_type="pat")
+        else:
+            logger.info("[GenieQueryClient] No OBO token — using SP auth (local dev)")
+            self._ws = WorkspaceClient()
+        self._api_path = f"/api/2.0/genie/spaces/{space_id}"
 
     @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=5,
-        factor=2,
-        jitter=backoff.full_jitter,
-        on_backoff=lambda details: logger.warning(
-            f"API request failed. Retrying in {details['wait']:.2f} seconds (attempt {details['tries']})"
-        )
+        backoff.expo, Exception, max_tries=5, factor=2, jitter=backoff.full_jitter,
+        on_backoff=lambda d: logger.warning(
+            f"Retrying in {d['wait']:.1f}s (attempt {d['tries']})"
+        ),
     )
     def start_conversation(self, question: str) -> Dict[str, Any]:
-        """Start a new conversation with the given question"""
-        return self.ws.api_client.do(
-            "POST",
-            f"{self.api_path}/start-conversation",
-            body={"content": question}
+        return self._ws.api_client.do(
+            "POST", f"{self._api_path}/start-conversation", body={"content": question}
         )
 
     @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=5,
-        factor=2,
-        jitter=backoff.full_jitter,
-        on_backoff=lambda details: logger.warning(
-            f"API request failed. Retrying in {details['wait']:.2f} seconds (attempt {details['tries']})"
-        )
+        backoff.expo, Exception, max_tries=5, factor=2, jitter=backoff.full_jitter,
+        on_backoff=lambda d: logger.warning(
+            f"Retrying in {d['wait']:.1f}s (attempt {d['tries']})"
+        ),
     )
     def send_message(self, conversation_id: str, message: str) -> Dict[str, Any]:
-        """Send a follow-up message to an existing conversation"""
-        return self.ws.api_client.do(
+        return self._ws.api_client.do(
             "POST",
-            f"{self.api_path}/conversations/{conversation_id}/messages",
-            body={"content": message}
+            f"{self._api_path}/conversations/{conversation_id}/messages",
+            body={"content": message},
         )
 
     @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=5,
-        factor=2,
-        jitter=backoff.full_jitter,
-        on_backoff=lambda details: logger.warning(
-            f"API request failed. Retrying in {details['wait']:.2f} seconds (attempt {details['tries']})"
-        )
+        backoff.expo, Exception, max_tries=5, factor=2, jitter=backoff.full_jitter,
+        on_backoff=lambda d: logger.warning(
+            f"Retrying in {d['wait']:.1f}s (attempt {d['tries']})"
+        ),
     )
     def get_message(self, conversation_id: str, message_id: str) -> Dict[str, Any]:
-        """Get the details of a specific message"""
-        return self.ws.api_client.do(
+        return self._ws.api_client.do(
             "GET",
-            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}"
+            f"{self._api_path}/conversations/{conversation_id}/messages/{message_id}",
         )
 
     @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=5,
-        factor=2,
-        jitter=backoff.full_jitter,
-        on_backoff=lambda details: logger.warning(
-            f"API request failed. Retrying in {details['wait']:.2f} seconds (attempt {details['tries']})"
-        )
+        backoff.expo, Exception, max_tries=5, factor=2, jitter=backoff.full_jitter,
+        on_backoff=lambda d: logger.warning(
+            f"Retrying in {d['wait']:.1f}s (attempt {d['tries']})"
+        ),
     )
-    def get_query_result(self, conversation_id: str, message_id: str, attachment_id: str) -> Dict[str, Any]:
-        """Get the query result using the attachment_id endpoint"""
-        result = self.ws.api_client.do(
+    def get_query_result(
+        self, conversation_id: str, message_id: str, attachment_id: str
+    ) -> Dict[str, Any]:
+        result = self._ws.api_client.do(
             "GET",
-            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/query-result"
+            f"{self._api_path}/conversations/{conversation_id}/messages/{message_id}"
+            f"/attachments/{attachment_id}/query-result",
         )
-
-        # Extract data_array from the correct nested location
         data_array = []
-        if 'statement_response' in result:
-            if 'result' in result['statement_response']:
-                data_array = result['statement_response']['result'].get('data_array', [])
-
+        if "statement_response" in result:
+            if "result" in result["statement_response"]:
+                data_array = result["statement_response"]["result"].get(
+                    "data_array", []
+                )
         return {
-                    'data_array': data_array,
-                    'schema': result.get('statement_response', {}).get('manifest', {}).get('schema', {})
-                }
+            "data_array": data_array,
+            "schema": result.get("statement_response", {})
+            .get("manifest", {})
+            .get("schema", {}),
+        }
 
     @backoff.on_exception(
-        backoff.expo,
-        Exception,
-        max_tries=5,
-        factor=2,
-        jitter=backoff.full_jitter,
-        on_backoff=lambda details: logger.warning(
-            f"API request failed. Retrying in {details['wait']:.2f} seconds (attempt {details['tries']})"
-        )
+        backoff.expo, Exception, max_tries=5, factor=2, jitter=backoff.full_jitter,
+        on_backoff=lambda d: logger.warning(
+            f"Retrying in {d['wait']:.1f}s (attempt {d['tries']})"
+        ),
     )
-    def execute_query(self, conversation_id: str, message_id: str, attachment_id: str) -> Dict[str, Any]:
-        """Execute a query using the attachment_id endpoint"""
-        return self.ws.api_client.do(
+    def execute_query(
+        self, conversation_id: str, message_id: str, attachment_id: str
+    ) -> Dict[str, Any]:
+        return self._ws.api_client.do(
             "POST",
-            f"{self.api_path}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/execute-query"
+            f"{self._api_path}/conversations/{conversation_id}/messages/{message_id}"
+            f"/attachments/{attachment_id}/execute-query",
         )
 
-
-    def wait_for_message_completion(self, conversation_id: str, message_id: str, timeout: int = 300, poll_interval: int = 2) -> Dict[str, Any]:
-        """
-        Wait for a message to reach a terminal state (COMPLETED, ERROR, etc.).
-
-        Args:
-            conversation_id: The ID of the conversation
-            message_id: The ID of the message
-            timeout: Maximum time to wait in seconds
-            poll_interval: Time between status checks in seconds
-
-        Returns:
-            The completed message
-        """
-
+    def wait_for_message_completion(
+        self,
+        conversation_id: str,
+        message_id: str,
+        timeout: int = 300,
+        poll_interval: int = 2,
+    ) -> Dict[str, Any]:
         start_time = time.time()
-        attempt = 1
-
         while time.time() - start_time < timeout:
-
             message = self.get_message(conversation_id, message_id)
             status = message.get("status")
-
             if status in ["COMPLETED", "ERROR", "FAILED"]:
                 return message
-
             time.sleep(poll_interval)
-            attempt += 1
-
         raise TimeoutError(f"Message processing timed out after {timeout} seconds")
 
-def start_new_conversation(question: str, user_token: str = None) -> Tuple[Optional[str], GenieResponse]:
-    """
-    Start a new conversation with Genie.
 
-    Args:
-        question: The initial question
-        user_token: OBO token from X-Forwarded-Access-Token header (optional)
+# ---------------------------------------------------------------------------
+# Helper: OBO WorkspaceClient for LLM calls
+# ---------------------------------------------------------------------------
 
-    Returns:
-        Tuple of (conversation_id, GenieResponse)
-    """
-    client = GenieClient(
-        host=DATABRICKS_HOST,
-        space_id=SPACE_ID,
-        user_token=user_token
-    )
+def make_obo_client(host: str, user_token: str = None) -> WorkspaceClient:
+    """Create an OBO WorkspaceClient for non-Genie API calls (e.g. LLM serving)."""
+    if user_token:
+        h = f"https://{host}" if host and not host.startswith("https://") else host
+        return WorkspaceClient(host=h, token=user_token, auth_type="pat")
+    return WorkspaceClient()
 
-    try:
-        response = client.start_conversation(question)
-        conversation_id = response.get("conversation_id")
-        message_id = response.get("message_id")
 
-        complete_message = client.wait_for_message_completion(conversation_id, message_id)
-        result = process_genie_response(client, conversation_id, message_id, complete_message)
-
-        return conversation_id, result
-
-    except Exception as e:
-        return None, GenieResponse(
-            text_response=f"Sorry, an error occurred: {str(e)}. Please try again.",
-            status="ERROR",
-            error=str(e)
-        )
-
-def continue_conversation(conversation_id: str, question: str, user_token: str = None) -> GenieResponse:
-    """
-    Send a follow-up message in an existing conversation.
-
-    Args:
-        conversation_id: The existing conversation ID
-        question: The follow-up question
-        user_token: OBO token from X-Forwarded-Access-Token header (optional)
-
-    Returns:
-        GenieResponse with all available data
-    """
-    logger.info(f"Continuing conversation {conversation_id} with question: {question[:30]}...")
-
-    client = GenieClient(
-        host=DATABRICKS_HOST,
-        space_id=SPACE_ID,
-        user_token=user_token
-    )
-
-    try:
-        response = client.send_message(conversation_id, question)
-        message_id = response.get("message_id")
-
-        complete_message = client.wait_for_message_completion(conversation_id, message_id)
-        return process_genie_response(client, conversation_id, message_id, complete_message)
-
-    except Exception as e:
-        if "429" in str(e) or "Too Many Requests" in str(e):
-            msg = "Sorry, the system is currently experiencing high demand. Please try again in a few moments."
-        elif "Conversation not found" in str(e):
-            msg = "Sorry, the previous conversation has expired. Please try your query again to start a new conversation."
-        else:
-            logger.error(f"Error continuing conversation: {str(e)}")
-            msg = f"Sorry, an error occurred: {str(e)}"
-        return GenieResponse(text_response=msg, status="ERROR", error=str(e))
+# ---------------------------------------------------------------------------
+# Public API — query functions
+# ---------------------------------------------------------------------------
 
 def _generate_data_summary(df: pd.DataFrame) -> str:
-    """Generate a brief summary of a DataFrame's contents."""
     lines = [f"Rows: {len(df)}, Columns: {len(df.columns)}"]
-
-    numeric_cols = df.select_dtypes(include=['number']).columns
+    numeric_cols = df.select_dtypes(include=["number"]).columns
     for col in numeric_cols[:5]:
-        lines.append(f"  {col}: min={df[col].min()}, max={df[col].max()}, mean={df[col].mean():.2f}")
-
+        lines.append(
+            f"  {col}: min={df[col].min()}, max={df[col].max()}, mean={df[col].mean():.2f}"
+        )
     if len(numeric_cols) > 5:
         lines.append(f"  ... and {len(numeric_cols) - 5} more numeric columns")
-
     return "\n".join(lines)
 
 
-def process_genie_response(client, conversation_id, message_id, complete_message) -> GenieResponse:
-    """
-    Process the response from Genie, collecting ALL available data.
-
-    Args:
-        client: The GenieClient instance
-        conversation_id: The conversation ID
-        message_id: The message ID
-        complete_message: The completed message response
-
-    Returns:
-        GenieResponse with all available fields populated
-    """
+def process_genie_response(
+    client: GenieQueryClient, conversation_id: str, message_id: str, complete_message: dict
+) -> GenieResponse:
     response = GenieResponse()
 
-    # Collect text from message content
-    if 'content' in complete_message:
-        response.text_response = complete_message.get('content', '')
+    if "content" in complete_message:
+        response.text_response = complete_message.get("content", "")
 
-    # Process all attachments (don't return early)
     attachments = complete_message.get("attachments", [])
     for attachment in attachments:
         attachment_id = attachment.get("attachment_id")
 
-        # Collect text content from attachment
         if "text" in attachment and "content" in attachment["text"]:
             response.text_response = attachment["text"]["content"]
 
-        # Collect query and data from attachment
         if "query" in attachment:
             query_info = attachment.get("query", {})
             response.sql_query = query_info.get("query", "")
             response.sql_description = query_info.get("description", None)
 
             try:
-                query_result = client.get_query_result(conversation_id, message_id, attachment_id)
-
-                data_array = query_result.get('data_array', [])
-                schema = query_result.get('schema', {})
-                columns = [col.get('name') for col in schema.get('columns', [])]
+                query_result = client.get_query_result(
+                    conversation_id, message_id, attachment_id
+                )
+                data_array = query_result.get("data_array", [])
+                schema = query_result.get("schema", {})
+                columns = [col.get("name") for col in schema.get("columns", [])]
 
                 if data_array:
                     if not columns and len(data_array) > 0:
                         columns = [f"column_{i}" for i in range(len(data_array[0]))]
-
                     df = pd.DataFrame(data_array, columns=columns)
-
-                    # Try to convert numeric columns
                     for col in df.columns:
                         try:
                             df[col] = pd.to_numeric(df[col])
                         except (ValueError, TypeError):
                             pass
-
                     response.data = df
                     response.data_summary = _generate_data_summary(df)
             except Exception as e:
                 logger.warning(f"Failed to get query result: {e}")
 
-    # If nothing was populated, set a default text
     if response.text_response is None and response.data is None:
         response.text_response = "No response available"
 
     return response
 
-def genie_query(question: str, user_token: str = None) -> GenieResponse:
-    """
-    Main entry point for querying Genie.
 
-    Args:
-        question: The question to ask
-        user_token: OBO token from X-Forwarded-Access-Token header (optional)
-
-    Returns:
-        GenieResponse with text_response, sql_query, sql_description, data, and data_summary
-    """
+def genie_query(
+    question: str, user_token: str = None, space_id: str = None
+) -> GenieResponse:
+    """Main entry point for querying Genie (uses OBO auth)."""
     try:
-        conversation_id, result = start_new_conversation(question, user_token=user_token)
-        return result
-
+        client = GenieQueryClient(
+            host=DATABRICKS_HOST,
+            space_id=space_id or SPACE_ID,
+            user_token=user_token,
+        )
+        response = client.start_conversation(question)
+        conversation_id = response.get("conversation_id")
+        message_id = response.get("message_id")
+        complete_message = client.wait_for_message_completion(
+            conversation_id, message_id
+        )
+        return process_genie_response(client, conversation_id, message_id, complete_message)
     except Exception as e:
-        logger.error(f"Error in conversation: {str(e)}. Please try again.")
+        logger.error(f"Error in genie_query: {e}")
         return GenieResponse(
             text_response=f"Sorry, an error occurred: {str(e)}. Please try again.",
             status="ERROR",
-            error=str(e)
+            error=str(e),
         )

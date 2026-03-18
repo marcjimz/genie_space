@@ -3,7 +3,7 @@ from dash import html, dcc, Input, Output, State, callback, ALL, MATCH, callback
 import dash_bootstrap_components as dbc
 import json
 from flask import request as flask_request
-from genie_room import genie_query, GenieResponse, _make_workspace_client
+from genie_room import genie_query, GenieResponse, GenieMetadataClient, make_obo_client
 import pandas as pd
 import os
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 load_dotenv()
 
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
+DEFAULT_SPACE_ID = os.environ.get("SPACE_ID")
 
 
 def _get_user_token():
@@ -21,23 +22,52 @@ def _get_user_token():
     except RuntimeError:
         return None
 
+
+def _get_space_id():
+    """Get space ID from URL query param, falling back to env var."""
+    try:
+        qs_space = flask_request.args.get("space_id")
+        if qs_space:
+            return qs_space
+    except RuntimeError:
+        pass
+    return DEFAULT_SPACE_ID
+
 # Create Dash app
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP]
 )
 
-# Add default welcome text that can be customized
-DEFAULT_WELCOME_TITLE = "Supply Chain Optimization"
-DEFAULT_WELCOME_DESCRIPTION = "Analyze your Supply Chain Performance leveraging AI/BI Dashboard. Deep dive into your data and metrics."
-
-# Add default suggestion questions
+# Default welcome text — overridden by space metadata or URL query params
+DEFAULT_WELCOME_TITLE = "Data Assistant"
+DEFAULT_WELCOME_DESCRIPTION = "Ask questions about your data using natural language."
 DEFAULT_SUGGESTIONS = [
     "What tables are there and how are they connected? Give me a short summary.",
-    "Which distribution center has the highest chance of being a bottleneck?",
     "Explain the dataset",
-    "What was the demand for our products by week in 2024?"
+    "Show me a summary of the data",
+    "What are the key metrics?"
 ]
+
+# Pre-fetch space metadata at startup (SP auth) so the layout renders
+# with the correct title/suggestions immediately, avoiding a flash of defaults.
+_startup_title = DEFAULT_WELCOME_TITLE
+_startup_desc = DEFAULT_WELCOME_DESCRIPTION
+_startup_suggestions = list(DEFAULT_SUGGESTIONS)
+if DEFAULT_SPACE_ID:
+    try:
+        _meta_client = GenieMetadataClient()
+        _meta = _meta_client.get_space_metadata(DEFAULT_SPACE_ID)
+        if _meta.get("title"):
+            _startup_title = _meta["title"]
+        if _meta.get("description"):
+            _startup_desc = _meta["description"]
+        else:
+            _startup_desc = f"Ask questions about your {_startup_title} data using natural language."
+        for i, q in enumerate(_meta.get("sample_questions", [])[:4]):
+            _startup_suggestions[i] = q
+    except Exception as e:
+        print(f"[startup] Metadata pre-fetch failed: {e}")
 
 # Define the layout
 app.layout = html.Div([
@@ -72,7 +102,7 @@ app.layout = html.Div([
             html.Div("Genie Space", id="logo-container", className="logo-container")
         ], className="nav-center"),
         html.Div([
-            html.Div("Y", className="user-avatar"),
+            html.Div("", id="user-avatar", className="user-avatar"),
             html.A(
                 html.Button(
                     "Logout",
@@ -99,7 +129,7 @@ app.layout = html.Div([
                
                     # Add settings button with tooltip
                     html.Div([
-                        html.Div(id="welcome-title", className="welcome-message", children=DEFAULT_WELCOME_TITLE),
+                        html.Div(id="welcome-title", className="welcome-message", children=_startup_title),
                         html.Button([
                             html.Img(src="assets/settings_icon.svg", className="settings-icon"),
                             html.Div("Customize welcome message", className="button-tooltip")
@@ -109,9 +139,9 @@ app.layout = html.Div([
                         title="Customize welcome message")
                     ], className="welcome-title-container"),
                     
-                    html.Div(id="welcome-description", 
+                    html.Div(id="welcome-description",
                             className="welcome-message-description",
-                            children=DEFAULT_WELCOME_DESCRIPTION),
+                            children=_startup_desc),
                     
                     # Add modal for editing welcome text
                     dbc.Modal([
@@ -195,22 +225,22 @@ app.layout = html.Div([
                     html.Div([
                         html.Button([
                             html.Div(className="suggestion-icon"),
-                            html.Div("What tables are there and how are they connected? Give me a short summary.", 
+                            html.Div(_startup_suggestions[0],
                                    className="suggestion-text", id="suggestion-1-text")
                         ], id="suggestion-1", className="suggestion-button"),
                         html.Button([
                             html.Div(className="suggestion-icon"),
-                            html.Div("Which distribution center has the highest chance of being a bottleneck?",
+                            html.Div(_startup_suggestions[1],
                                    className="suggestion-text", id="suggestion-2-text")
                         ], id="suggestion-2", className="suggestion-button"),
                         html.Button([
                             html.Div(className="suggestion-icon"),
-                            html.Div("Explain the dataset",
+                            html.Div(_startup_suggestions[2],
                                    className="suggestion-text", id="suggestion-3-text")
                         ], id="suggestion-3", className="suggestion-button"),
                         html.Button([
                             html.Div(className="suggestion-icon"),
-                            html.Div("What was the demand for our products by week in 2024?",
+                            html.Div(_startup_suggestions[3],
                                    className="suggestion-text", id="suggestion-4-text")
                         ], id="suggestion-4", className="suggestion-button")
                     ], className="suggestion-buttons")
@@ -247,6 +277,7 @@ app.layout = html.Div([
     ], id="main-content", className="main-content"),
     
     html.Div(id='dummy-output'),
+    dcc.Location(id="url-location", refresh=False),
     dcc.Store(id="chat-trigger", data={"trigger": False, "message": ""}),
     dcc.Store(id="chat-history-store", data=[]),
     dcc.Store(id="query-running-store", data=False),
@@ -255,6 +286,68 @@ app.layout = html.Div([
 
 # Store chat history
 chat_history = []
+
+
+# Populate welcome text and suggestions from Genie Space metadata on page load
+@app.callback(
+    [Output("welcome-title", "children"),
+     Output("welcome-description", "children"),
+     Output("suggestion-1-text", "children"),
+     Output("suggestion-2-text", "children"),
+     Output("suggestion-3-text", "children"),
+     Output("suggestion-4-text", "children")],
+    [Input("url-location", "search")],
+)
+def _set_welcome_from_space(search):
+    space_id = _get_space_id()
+    title = DEFAULT_WELCOME_TITLE
+    desc = DEFAULT_WELCOME_DESCRIPTION
+    suggestions = list(DEFAULT_SUGGESTIONS)
+
+    # Use SP auth for space metadata (GenieMetadataClient).
+    # The Genie Space metadata API requires the 'genie' OAuth scope which is
+    # not available for Databricks Apps OBO tokens.
+    if space_id:
+        try:
+            metadata_client = GenieMetadataClient()
+            meta = metadata_client.get_space_metadata(space_id)
+
+            if meta.get("title"):
+                title = meta["title"]
+            if meta.get("description"):
+                desc = meta["description"]
+            else:
+                desc = f"Ask questions about your {title} data using natural language."
+
+            sq = meta.get("sample_questions", [])
+            for i, q in enumerate(sq[:4]):
+                suggestions[i] = q
+        except Exception as e:
+            print(f"[welcome] Metadata fetch failed: {e}")
+
+    return title, desc, suggestions[0], suggestions[1], suggestions[2], suggestions[3]
+
+
+# Set user avatar initial from logged-in user's identity
+@app.callback(
+    Output("user-avatar", "children"),
+    [Input("url-location", "search")],
+)
+def _set_user_avatar(search):
+    try:
+        email = flask_request.headers.get("X-Forwarded-Email", "")
+        if not email:
+            user = flask_request.headers.get("X-Forwarded-User", "")
+            if user:
+                email = user
+        if email:
+            # Use first letter of the name part (before @)
+            name = email.split("@")[0].split(".")[0]
+            return name[0].upper()
+    except RuntimeError:
+        pass
+    return ""
+
 
 def format_sql_query(sql_query):
     """Format SQL query using sqlparse library"""
@@ -289,7 +382,9 @@ def call_llm_for_insights(df, prompt=None, user_token=None):
     csv_data = df.to_csv(index=False)
     full_prompt = f"{prompt}Table data:\n{csv_data}"
     try:
-        client = _make_workspace_client(DATABRICKS_HOST, user_token)
+        # Use SP auth — 'model-serving' scope is not available for OBO tokens
+        from databricks.sdk import WorkspaceClient
+        client = WorkspaceClient()
         response = client.serving_endpoints.query(
             os.getenv("SERVING_ENDPOINT_NAME"),
             messages=[ChatMessage(content=full_prompt, role=ChatMessageRole.USER)],
@@ -354,9 +449,16 @@ def handle_all_inputs(s1_clicks, s2_clicks, s3_clicks, s4_clicks, send_clicks, s
         return [no_update] * 8
     
     # Create user message with user info
+    user_initial = ""
+    try:
+        email = flask_request.headers.get("X-Forwarded-Email", "") or flask_request.headers.get("X-Forwarded-User", "")
+        if email:
+            user_initial = email.split("@")[0].split(".")[0][0].upper()
+    except RuntimeError:
+        pass
     user_message = html.Div([
         html.Div([
-            html.Div("Y", className="user-avatar"),
+            html.Div(user_initial, className="user-avatar"),
             html.Span("You", className="model-name")
         ], className="user-info"),
         html.Div(user_input, className="message-text")
@@ -433,7 +535,8 @@ def get_model_response(trigger_data, current_messages, chat_history):
     
     try:
         user_token = _get_user_token()
-        genie_response = genie_query(user_input, user_token=user_token)
+        space_id = _get_space_id()
+        genie_response = genie_query(user_input, user_token=user_token, space_id=space_id)
 
         content_parts = []
 

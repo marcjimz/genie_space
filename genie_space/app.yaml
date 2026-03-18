@@ -7,3 +7,9 @@ env:
   valueFrom: "genie-space"
 - name: "SERVING_ENDPOINT_NAME"
   valueFrom: "serving-endpoint"
+
+authorization:
+  type: oauth
+  scopes:
+    - genie
+    - sql
