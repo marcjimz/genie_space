@@ -4,12 +4,16 @@ import dash_bootstrap_components as dbc
 import json
 from flask import request as flask_request
 from genie_room import genie_query, GenieResponse, GenieMetadataClient, make_obo_client
+from chart_generator import generate_chart
+import logging
 import pandas as pd
 import os
 from dotenv import load_dotenv
 import sqlparse
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
 DEFAULT_SPACE_ID = os.environ.get("SPACE_ID")
@@ -603,6 +607,31 @@ def get_model_response(trigger_data, current_messages, chat_history):
                 'paddingRight': '5px'
             }))
 
+            # Auto-visualization — async chart generation
+            chart_index = f"chart-{len(chat_history)}-{len(current_messages)}"
+            if chat_history and len(chat_history) > 0:
+                chat_history[0].setdefault('chart_context', {})[chart_index] = {
+                    'df': df.to_json(orient='split'),
+                    'question': user_input,
+                    'sql_description': genie_response.sql_description or '',
+                }
+            content_parts.append(html.Div([
+                dcc.Loading(
+                    type="dot",
+                    color="#9ca3af",
+                    children=html.Div(id={"type": "chart-output", "index": chart_index}),
+                    custom_spinner=html.Div([
+                        html.Span(className="chart-spinner"),
+                        html.Span("Generating visualization...",
+                                  className="chart-loading-text")
+                    ], className="chart-loading-indicator"),
+                ),
+                dcc.Interval(
+                    id={"type": "chart-interval", "index": chart_index},
+                    interval=100, max_intervals=1,
+                ),
+            ], className="chart-section"))
+
             # Data summary section
             if genie_response.data_summary:
                 content_parts.append(
@@ -879,6 +908,73 @@ def toggle_query_visibility(n_clicks):
         return "query-code-container visible", "Hide code"
     return "query-code-container hidden", "Show code"
 
+# Toggle chart visibility (clientside for reliability with dynamic components)
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (!n_clicks) return [window.dash_clientside.no_update, window.dash_clientside.no_update];
+        if (n_clicks % 2 === 1) {
+            return ["chart-container hidden", "Show chart"];
+        }
+        return ["chart-container visible", "Hide chart"];
+    }
+    """,
+    [Output({"type": "chart-container", "index": MATCH}, "className"),
+     Output({"type": "toggle-chart-text", "index": MATCH}, "children")],
+    [Input({"type": "toggle-chart", "index": MATCH}, "n_clicks")],
+    prevent_initial_call=True
+)
+
+# Auto-generate chart asynchronously after response renders
+@app.callback(
+    Output({"type": "chart-output", "index": MATCH}, "children"),
+    Input({"type": "chart-interval", "index": MATCH}, "n_intervals"),
+    [State({"type": "chart-interval", "index": MATCH}, "id"),
+     State("chat-history-store", "data")],
+    prevent_initial_call=True
+)
+def auto_generate_chart(n_intervals, interval_id, chat_history):
+    if not n_intervals:
+        return dash.no_update
+    chart_index = interval_id["index"]
+    ctx = {}
+    if chat_history:
+        ctx = chat_history[0].get('chart_context', {}).get(chart_index, {})
+    if not ctx or 'df' not in ctx:
+        return html.Div()
+    try:
+        df = pd.read_json(ctx['df'], orient='split')
+        fig = generate_chart(df, ctx['question'], ctx.get('sql_description'))
+        if fig is None:
+            return html.Div()
+        return html.Div([
+            html.Div([
+                html.Button([
+                    html.Span("Hide chart",
+                              id={"type": "toggle-chart-text", "index": chart_index})
+                ],
+                id={"type": "toggle-chart", "index": chart_index},
+                className="toggle-chart-button",
+                n_clicks=0)
+            ], className="toggle-chart-container"),
+            html.Div([
+                dcc.Graph(
+                    figure=fig,
+                    config={
+                        "displayModeBar": True,
+                        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+                        "displaylogo": False,
+                    },
+                    className="chart-graph",
+                )
+            ],
+            id={"type": "chart-container", "index": chart_index},
+            className="chart-container visible")
+        ], className="chart-section-content")
+    except Exception as e:
+        logger.warning(f"[auto-viz] Chart generation failed: {e}")
+        return html.Div()
+
 # Add callbacks for welcome text customization
 @app.callback(
     [Output("edit-welcome-modal", "is_open", allow_duplicate=True),
@@ -982,4 +1078,4 @@ def generate_insights(n_clicks, btn_id, chat_history):
     ], className="insight-wrapper")
 
 if __name__ == "__main__":
-    app.run_server(debug=True)
+    app.run_server(debug=False)

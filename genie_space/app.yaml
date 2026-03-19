@@ -7,6 +7,8 @@ env:
   valueFrom: "genie-space"
 - name: "SERVING_ENDPOINT_NAME"
   valueFrom: "serving-endpoint"
+- name: "VISUALIZATION_ENDPOINT_NAME"
+  valueFrom: "visualization-endpoint"
 
 authorization:
   type: oauth
